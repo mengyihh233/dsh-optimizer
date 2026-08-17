@@ -1,0 +1,4 @@
+# dsh-optimizer: one global host row registering the optimizer tools.
+- insert:
+    - id: dsh-optimizer
+      name: dsh-optimizer
