@@ -12,16 +12,26 @@
  * 补丁让 history 页跳过 chunk（tail 页从 ~2.7 万事件降到 ~200，约 130 倍）。
  */
 import type { Context } from '@deepseek-ai/cordis'
-import { defineTool } from '@deepseek-ai/dsh-tools'
 import { readdir, readFile, stat, mkdir, rename } from 'node:fs/promises'
 import { existsSync, readFileSync, writeFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { zstdDecompressSync } from 'node:zlib'
 
-// host 运行时全局（bundle 插件 builtin）——TS 类型声明
+// host 运行时全局（bundle 插件 builtin）——TS 类型声明。
+// 工具注册用 harness.defineTool（宿主注入），避免运行时 import @deepseek-ai/*，
+// 这样插件在 link 缓存安装模式下也无需解析内部包。
 declare const harness: {
   handle: (method: string, handler: (args: Record<string, unknown>) => unknown | Promise<unknown>) => () => void
+  defineTool: <T>(options: T) => T
+}
+
+// ctx.tools 由 @deepseek-ai/dsh-tools 模块增强提供；插件不依赖该包运行时，
+// 仅在此声明类型以通过编译（实际由宿主注入）。
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    tools: { register: (tool: unknown) => unknown }
+  }
 }
 
 export const name = 'dsh-optimizer'
@@ -333,7 +343,7 @@ export function apply(ctx: Context): void {
   })
 
   // ---- optimizer_audit: 会话体检 ----
-  ctx.tools.register(defineTool({
+  ctx.tools.register(harness.defineTool({
     name: 'optimizer_audit',
     description: '扫描 DSH 会话目录，报告会话总数、总大小、空会话数、以及最大的 N 个会话（含事件规模与流式 chunk 占比），用于定位拖慢会话切换的大会话。',
     parameters: {
@@ -349,7 +359,7 @@ export function apply(ctx: Context): void {
           text: { type: 'string', required: true },
         },
       },
-      render: (_args, value: { text: string }) => [{ type: 'text', text: value.text }],
+      render: (_args: unknown, value: { text: string }) => [{ type: 'text', text: value.text }],
     },
     async execute(args: { limit?: number; minMB?: number; full?: string }) {
       const limit = args.limit ?? 15
@@ -382,7 +392,7 @@ export function apply(ctx: Context): void {
   }))
 
   // ---- optimizer_archive: 归档旧/大会话 ----
-  ctx.tools.register(defineTool({
+  ctx.tools.register(harness.defineTool({
     name: 'optimizer_archive',
     description: '把不再活跃的大会话（超过 N 天未动且超过 X MB）从 ~/.dsh/sessions 移到 ~/.dsh/sessions-archive/，DSH 不再加载它们，会话列表与切换速度立刻变快。归档可恢复（手动移回原工作区目录即可）。',
     parameters: {
@@ -398,7 +408,7 @@ export function apply(ctx: Context): void {
           text: { type: 'string', required: true },
         },
       },
-      render: (_args, value: { text: string }) => [{ type: 'text', text: value.text }],
+      render: (_args: unknown, value: { text: string }) => [{ type: 'text', text: value.text }],
     },
     async execute(args: { olderThanDays?: number; minMB?: number; ids?: string }) {
       const olderDays = args.olderThanDays ?? 7
@@ -430,7 +440,7 @@ export function apply(ctx: Context): void {
   }))
 
   // ---- optimizer_cleanup: 清理空会话 ----
-  ctx.tools.register(defineTool({
+  ctx.tools.register(harness.defineTool({
     name: 'optimizer_cleanup',
     description: '扫描并处理空/损坏的会话（0 字节或无日志文件）。默认 dryRun=true 只列出候选；dryRun=false 时把候选移入 sessions-archive（可恢复，不直接删除）。',
     parameters: {
@@ -444,7 +454,7 @@ export function apply(ctx: Context): void {
           text: { type: 'string', required: true },
         },
       },
-      render: (_args, value: { text: string }) => [{ type: 'text', text: value.text }],
+      render: (_args: unknown, value: { text: string }) => [{ type: 'text', text: value.text }],
     },
     async execute(args: { dryRun?: string }) {
       const doMove = String(args.dryRun ?? '') === 'false'
@@ -478,7 +488,7 @@ export function apply(ctx: Context): void {
   }))
 
   // ---- optimizer_patch: 补丁管理 ----
-  ctx.tools.register(defineTool({
+  ctx.tools.register(harness.defineTool({
     name: 'optimizer_patch',
     description: '管理「history 分页跳过流式 chunk」补丁（针对部署的 dsh-host-apiproxy）：status 检查，apply 应用（幂等，滤 chunk 且补回边界事件保证分页连续性），revert 回滚。补丁让长会话切换从数秒降到亚秒级。',
     parameters: {
@@ -492,7 +502,7 @@ export function apply(ctx: Context): void {
           text: { type: 'string', required: true },
         },
       },
-      render: (_args, value: { text: string }) => [{ type: 'text', text: value.text }],
+      render: (_args: unknown, value: { text: string }) => [{ type: 'text', text: value.text }],
     },
     async execute(args: { action?: string }) {
       const action = args.action ?? 'status'
