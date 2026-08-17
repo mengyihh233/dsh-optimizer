@@ -1,7 +1,7 @@
 /**
  * dsh-optimizer client — 设置页「优化」面板
  * 一键扫描 → 列出可优化问题 → 逐项修复 / 一键优化全部。
- * 通过 host.call 与 host 半部通信（optimizer/scan, optimizer/apply）。
+ * 通过 host 自建的 HTTP RPC endpoint 通信（/dsh-optimizer/rpc）。
  */
 
 // client 运行时全局（bundle 插件 builtin）——TS 类型声明
@@ -12,12 +12,20 @@ declare const React: {
   useCallback: <T extends (...args: never[]) => unknown>(fn: T, deps: unknown[]) => T
   useMemo: <T>(fn: () => T, deps: unknown[]) => T
 }
-declare const host: { call: (method: string, args?: Record<string, unknown>) => Promise<unknown> }
 declare const styles: { insert: (css: string) => () => void }
 
 import type { Context } from '@deepseek-ai/cordis'
 
-
+// bundle 插件 client 半部无 host.call —— 走 host 自建的 HTTP RPC endpoint
+async function rpc(method: string, args?: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const res = await fetch('/dsh-optimizer/rpc', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ method, args: args ?? {} }),
+  })
+  if (!res.ok) throw new Error(`RPC ${method} HTTP ${res.status}`)
+  return (await res.json()) as Record<string, unknown>
+}
 export const name = 'dsh-optimizer'
 export const inject = ['slots']
 
@@ -80,7 +88,7 @@ function OptimizerSettings(props: { close: () => void }) {
   const runScan = React.useCallback(async () => {
     setLoading(true)
     try {
-      const r = (await host.call('optimizer/scan')) as ScanResult
+      const r = (await rpc('optimizer/scan')) as unknown as ScanResult
       setScan(r)
       if (!r.ok) pushLog('扫描失败: ' + (r.message ?? '未知错误'))
       else pushLog(`扫描完成：${r.stats?.total ?? 0} 会话 / ${r.stats?.totalMB ?? 0}MB，发现 ${r.issues?.length ?? 0} 项`)
@@ -98,7 +106,7 @@ function OptimizerSettings(props: { close: () => void }) {
   const doFix = React.useCallback(async (id: string, fix: string, label: string) => {
     setApplying(id)
     try {
-      const r = (await host.call('optimizer/apply', { fix })) as { ok: boolean; message?: string }
+      const r = (await rpc('optimizer/apply', { fix })) as { ok: boolean; message?: string }
       pushLog(`${r.ok ? '✓' : '✗'} ${label}: ${r.message ?? ''}`)
       await runScan()
     } catch (e) {
@@ -114,7 +122,7 @@ function OptimizerSettings(props: { close: () => void }) {
     try {
       for (const issue of scan.issues) {
         if (!issue.fix || issue.fix === 'none') continue
-        const r = (await host.call('optimizer/apply', { fix: issue.fix })) as { ok: boolean; message?: string }
+        const r = (await rpc('optimizer/apply', { fix: issue.fix })) as { ok: boolean; message?: string }
         pushLog(`${r.ok ? '✓' : '✗'} ${issue.title}: ${r.message ?? ''}`)
       }
       pushLog('一键优化完成')

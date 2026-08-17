@@ -12,13 +12,6 @@
  * 补丁让 history 页跳过 chunk（tail 页从 ~2.7 万事件降到 ~200，约 130 倍）。
  */
 import type { Context } from '@deepseek-ai/cordis';
-declare module '@deepseek-ai/cordis' {
-    interface Context {
-        tools: {
-            register: (tool: unknown) => unknown;
-        };
-    }
-}
 export declare const name = "dsh-optimizer";
 export declare const inject: string[];
 export declare function apply(ctx: Context): void;

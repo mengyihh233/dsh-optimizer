@@ -12,27 +12,17 @@
  * 补丁让 history 页跳过 chunk（tail 页从 ~2.7 万事件降到 ~200，约 130 倍）。
  */
 import type { Context } from '@deepseek-ai/cordis'
+import { defineTool } from '@deepseek-ai/dsh-tools'
 import { readdir, readFile, stat, mkdir, rename } from 'node:fs/promises'
 import { existsSync, readFileSync, writeFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { zstdDecompressSync } from 'node:zlib'
 
-// host 运行时全局（bundle 插件 builtin）——TS 类型声明。
-// 工具注册用 harness.defineTool（宿主注入），避免运行时 import @deepseek-ai/*，
-// 这样插件在 link 缓存安装模式下也无需解析内部包。
-declare const harness: {
-  handle: (method: string, handler: (args: Record<string, unknown>) => unknown | Promise<unknown>) => () => void
-  defineTool: <T>(options: T) => T
-}
-
-// ctx.tools 由 @deepseek-ai/dsh-tools 模块增强提供；插件不依赖该包运行时，
-// 仅在此声明类型以通过编译（实际由宿主注入）。
-declare module '@deepseek-ai/cordis' {
-  interface Context {
-    tools: { register: (tool: unknown) => unknown }
-  }
-}
+// bundle 插件 host 半部没有 harness builtin（那是动态 Cordis 插件的沙箱注入）。
+// 工具注册用 @deepseek-ai/dsh-tools 的 defineTool + ctx.tools.register（learn-everything
+// 同款）；设置页 RPC 用 host 自建 webServer HTTP endpoint（prompt-enhancer 同款）。
+// @deepseek-ai/* 的可解析性由 scripts/setup-dsh-links.mjs 提供（junction 链接部署根）。
 
 export const name = 'dsh-optimizer'
 export const inject = ['tools']
@@ -324,26 +314,82 @@ async function applyFix(fix: string): Promise<{ ok: boolean; message: string }> 
 // ---------------------------------------------------------------------------
 
 export function apply(ctx: Context): void {
-  // ---- 设置页「一键优化」RPC ----
-  harness.handle('optimizer/scan', async () => {
-    try {
-      return { ok: true, ...(await scanIssues()) }
-    } catch (e) {
-      return { ok: false, message: String(e) }
-    }
-  })
-  harness.handle('optimizer/apply', async (args) => {
-    const fix = args && typeof (args as { fix?: string }).fix === 'string' ? (args as { fix: string }).fix : ''
-    if (!fix) return { ok: false, message: '缺少 fix 参数' }
-    try {
-      return await applyFix(fix)
-    } catch (e) {
-      return { ok: false, message: String(e) }
-    }
-  })
+  // ---- 设置页「一键优化」RPC（host 自建 HTTP endpoint，bundle 插件无 harness）----
+  const rpcHandlers: Record<string, (args: Record<string, unknown>) => Promise<unknown>> = {
+    'optimizer/scan': async () => {
+      try {
+        return { ok: true, ...(await scanIssues()) }
+      } catch (e) {
+        return { ok: false, message: String(e) }
+      }
+    },
+    'optimizer/apply': async (args) => {
+      const fix = typeof args?.fix === 'string' ? args.fix : ''
+      if (!fix) return { ok: false, message: '缺少 fix 参数' }
+      try {
+        return await applyFix(fix)
+      } catch (e) {
+        return { ok: false, message: String(e) }
+      }
+    },
+  }
+  const webServer = ctx.get('webServer') as
+    | { register: (opts: { kind: string; path: string; handler: (req: unknown, res: unknown) => void | Promise<void> }) => unknown }
+    | undefined
+  if (webServer !== undefined && typeof webServer.register === 'function') {
+    webServer.register({
+      kind: 'exact',
+      path: '/dsh-optimizer/rpc',
+      handler: async (req: unknown, res: unknown) => {
+        const request = req as { method?: string; on?: (ev: string, cb: (chunk: string) => void) => void }
+        const response = res as { writeHead: (code: number, headers?: Record<string, string>) => void; end: (body: string) => void }
+        if (request?.method !== 'POST') {
+          response.writeHead(405, { 'content-type': 'application/json' })
+          response.end(JSON.stringify({ ok: false, code: 'METHOD_NOT_ALLOWED' }))
+          return
+        }
+        let body = ''
+        const on = request.on
+        if (typeof on === 'function') {
+          await new Promise<void>((resolve) => {
+            let settled = false
+            const finish = () => { if (!settled) { settled = true; resolve() } }
+            on('data', (chunk: string) => { body += chunk })
+            on('end', finish)
+            on('error', finish)
+          })
+        }
+        let method = ''
+        let args: Record<string, unknown> = {}
+        try {
+          const parsed = JSON.parse(body || '{}')
+          method = typeof parsed.method === 'string' ? parsed.method : ''
+          args = typeof parsed.args === 'object' && parsed.args !== null ? parsed.args : {}
+        } catch {
+          response.writeHead(400, { 'content-type': 'application/json' })
+          response.end(JSON.stringify({ ok: false, code: 'BAD_JSON' }))
+          return
+        }
+        const fn = rpcHandlers[method]
+        if (!fn) {
+          response.writeHead(404, { 'content-type': 'application/json' })
+          response.end(JSON.stringify({ ok: false, code: 'UNKNOWN_METHOD', method }))
+          return
+        }
+        try {
+          const result = await fn(args)
+          response.writeHead(200, { 'content-type': 'application/json' })
+          response.end(JSON.stringify(result))
+        } catch (e) {
+          response.writeHead(500, { 'content-type': 'application/json' })
+          response.end(JSON.stringify({ ok: false, message: String(e) }))
+        }
+      },
+    })
+  }
 
   // ---- optimizer_audit: 会话体检 ----
-  ctx.tools.register(harness.defineTool({
+  ctx.tools.register(defineTool({
     name: 'optimizer_audit',
     description: '扫描 DSH 会话目录，报告会话总数、总大小、空会话数、以及最大的 N 个会话（含事件规模与流式 chunk 占比），用于定位拖慢会话切换的大会话。',
     parameters: {
@@ -392,7 +438,7 @@ export function apply(ctx: Context): void {
   }))
 
   // ---- optimizer_archive: 归档旧/大会话 ----
-  ctx.tools.register(harness.defineTool({
+  ctx.tools.register(defineTool({
     name: 'optimizer_archive',
     description: '把不再活跃的大会话（超过 N 天未动且超过 X MB）从 ~/.dsh/sessions 移到 ~/.dsh/sessions-archive/，DSH 不再加载它们，会话列表与切换速度立刻变快。归档可恢复（手动移回原工作区目录即可）。',
     parameters: {
@@ -440,7 +486,7 @@ export function apply(ctx: Context): void {
   }))
 
   // ---- optimizer_cleanup: 清理空会话 ----
-  ctx.tools.register(harness.defineTool({
+  ctx.tools.register(defineTool({
     name: 'optimizer_cleanup',
     description: '扫描并处理空/损坏的会话（0 字节或无日志文件）。默认 dryRun=true 只列出候选；dryRun=false 时把候选移入 sessions-archive（可恢复，不直接删除）。',
     parameters: {
@@ -488,7 +534,7 @@ export function apply(ctx: Context): void {
   }))
 
   // ---- optimizer_patch: 补丁管理 ----
-  ctx.tools.register(harness.defineTool({
+  ctx.tools.register(defineTool({
     name: 'optimizer_patch',
     description: '管理「history 分页跳过流式 chunk」补丁（针对部署的 dsh-host-apiproxy）：status 检查，apply 应用（幂等，滤 chunk 且补回边界事件保证分页连续性），revert 回滚。补丁让长会话切换从数秒降到亚秒级。',
     parameters: {

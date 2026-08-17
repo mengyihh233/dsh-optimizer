@@ -1,6 +1,6 @@
 {
   "name": "dsh-optimizer",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "DSH 优化插件：会话体检 / 归档 / 清理 + history 分页补丁管理（流式 chunk 事件不再拖慢会话切换）",
   "main": "./lib/index.js",
   "types": "./lib/index.d.ts",
@@ -36,12 +36,18 @@
   "files": [
     "lib",
     "src",
+    "scripts",
     "cordis.patch.yml",
     "README.md"
   ],
   "scripts": {
+    "prepare": "node scripts/setup-dsh-links.mjs",
     "build": "tsc -p tsconfig.json",
     "prepack": "npm run build"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=0.1.0-rc.0",
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.0"
   },
   "devDependencies": {
     "typescript": "^5.5.0",
