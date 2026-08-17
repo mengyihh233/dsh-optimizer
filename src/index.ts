@@ -19,6 +19,11 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { zstdDecompressSync } from 'node:zlib'
 
+// host 运行时全局（bundle 插件 builtin）——TS 类型声明
+declare const harness: {
+  handle: (method: string, handler: (args: Record<string, unknown>) => unknown | Promise<unknown>) => () => void
+}
+
 export const name = 'dsh-optimizer'
 export const inject = ['tools']
 
@@ -108,11 +113,11 @@ const PATCH_BLOCK = `${PATCH_START}
 const HISTORY_SKIPPED_TYPES = new Set(["assistant/chunk"]);
 ${PATCH_END}`
 const PATCH_TARGET_LINE = `const MESSAGE_TYPES = new Set(["user/message", "assistant/message"]);`
-const PAGINATE_FROM = `events: window.filter((event) => event.seq >= cut)`
-const PAGINATE_TO = `events: window.filter((event) => event.seq >= cut && !HISTORY_SKIPPED_TYPES.has(event.type))`
-// 第二处：historyCutOf 展开拷贝 attached 事件时同步滤 chunk（13 万 → 数百）
-const CUTOF_FROM = `const events = [...source.session.events];`
-const CUTOF_TO = `const events = source.session.events.filter((event) => event.type !== "assistant/chunk");`
+const PAGINATE_FROM = `events: window.filter((event) => event.seq >= cut),`
+// 补丁后的分页返回形态：滤 chunk + 补回窗口尾部边界事件（保客户端 loadOlder 连续性）
+const PAGINATE_TO_HEAD = `events: window.filter((event) => event.seq >= cut && !HISTORY_SKIPPED_TYPES.has(event.type)).concat(`
+// revert 用正则匹配跨行的补丁返回块（含 concat 边界补回逻辑）
+const PAGINATE_PATCHED_RE = /events: window\.filter\(\(event\) => event\.seq >= cut && !HISTORY_SKIPPED_TYPES\.has\(event\.type\)\)\.concat\([\s\S]*?\n\s*\),/
 
 /** 探测 dsh-host-apiproxy 部署文件（候选部署根列表，取第一个存在的）。 */
 function findHostApiproxyIndex(): string | null {
@@ -147,51 +152,30 @@ interface PatchState {
 
 function inspectPatch(file: string): PatchState {
   const src = readFileSync(file, 'utf8')
-  const hasMarker = src.includes(PATCH_START) || src.includes('HISTORY_SKIPPED_TYPES')
-  const hasCutof = src.includes(CUTOF_TO)
-  const patched = hasMarker && hasCutof
+  const patched = src.includes(PATCH_START) || src.includes('HISTORY_SKIPPED_TYPES')
   const details: string[] = []
   if (!src.includes(PATCH_TARGET_LINE)) details.push('目标行 MESSAGE_TYPES 未找到，部署版本可能已变更')
-  if (hasMarker && !hasCutof) details.push('部分补丁：paginate 已改，historyCutOf 未改')
   return { file, patched, details }
 }
 
 function applyPatch(file: string): PatchState {
   const src = readFileSync(file, 'utf8')
-  const details: string[] = []
+  if (src.includes(PATCH_START)) return { file, patched: true, details: ['补丁已存在'] }
   if (!src.includes(PATCH_TARGET_LINE)) return { file, patched: false, details: ['目标行 MESSAGE_TYPES 未找到，无法应用'] }
-  // 第一处：定义 HISTORY_SKIPPED_TYPES + paginate 返回滤 chunk
-  if (!src.includes(PATCH_START)) {
-    if (!src.includes(PAGINATE_FROM)) return { file, patched: false, details: ['分页返回行未找到（可能已是补丁后的形态）'] }
-    const withBlock = src.replace(PATCH_TARGET_LINE, PATCH_TARGET_LINE + '\n' + PATCH_BLOCK)
-    const withFilter = withBlock.replace(PAGINATE_FROM, PAGINATE_TO)
-    writeFileSync(file, withFilter, 'utf8')
-    details.push('paginate 已应用')
-  } else {
-    details.push('paginate 已存在')
-  }
-  // 第二处：historyCutOf 拷贝时滤 chunk
-  const now = readFileSync(file, 'utf8')
-  if (!now.includes(CUTOF_TO)) {
-    if (!now.includes(CUTOF_FROM)) return { file, patched: false, details: [...details, 'historyCutOf 目标行未找到，无法应用'] }
-    writeFileSync(file, now.replace(CUTOF_FROM, CUTOF_TO), 'utf8')
-    details.push('historyCutOf 已应用')
-  } else {
-    details.push('historyCutOf 已存在')
-  }
-  return { file, patched: true, details }
+  if (!src.includes(PAGINATE_FROM)) return { file, patched: false, details: ['分页返回行未找到（可能已是补丁后的形态）'] }
+  const withBlock = src.replace(PATCH_TARGET_LINE, PATCH_TARGET_LINE + '\n' + PATCH_BLOCK)
+  const withFilter = withBlock.replace(PAGINATE_FROM, PAGINATE_TO_HEAD + `\n\t\t\tbeforeSeq === void 0 ? [] : (() => {\n\t\t\t\tconst boundary = window[window.length - 1];\n\t\t\t\treturn boundary !== void 0 && boundary.seq >= cut && HISTORY_SKIPPED_TYPES.has(boundary.type) ? [boundary] : [];\n\t\t\t})()\n\t\t),`)
+  writeFileSync(file, withFilter, 'utf8')
+  return { file, patched: true, details: ['已应用：history 页跳过 assistant/chunk（含边界保序）'] }
 }
 
 function revertPatch(file: string): PatchState {
   const src = readFileSync(file, 'utf8')
-  const hasMarker = src.includes(PATCH_START)
-  const hasCutof = src.includes(CUTOF_TO)
-  if (!hasMarker && !src.includes(PAGINATE_TO) && !hasCutof) return { file, patched: false, details: ['未检测到补丁'] }
+  if (!src.includes(PATCH_START) && !src.includes('HISTORY_SKIPPED_TYPES')) return { file, patched: false, details: ['未检测到补丁'] }
   let out = src
-  // 第二处回滚
-  out = out.split(CUTOF_TO).join(CUTOF_FROM)
-  // 第一处回滚：paginate 行 + 补丁块
-  out = out.split(PAGINATE_TO).join(PAGINATE_FROM)
+  // 恢复分页返回行（含跨行补丁块）
+  out = out.replace(PAGINATE_PATCHED_RE, PAGINATE_FROM)
+  // 移除补丁块
   const startIdx = out.indexOf(PATCH_START)
   if (startIdx >= 0) {
     const endIdx = out.indexOf(PATCH_END, startIdx)
@@ -199,8 +183,10 @@ function revertPatch(file: string): PatchState {
       out = out.slice(0, startIdx) + out.slice(endIdx + PATCH_END.length)
     }
   }
+  // 兜底：删除残留的常量定义行（兼容早期无标记补丁形态）
+  out = out.split('\n').filter(line => line.trim() !== `const HISTORY_SKIPPED_TYPES = new Set(["assistant/chunk"]);`).join('\n')
   writeFileSync(file, out, 'utf8')
-  return { file, patched: false, details: ['已回滚两处补丁'] }
+  return { file, patched: false, details: ['已回滚补丁'] }
 }
 
 // ---------------------------------------------------------------------------
@@ -208,10 +194,144 @@ function revertPatch(file: string): PatchState {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
+// 扫描与修复（设置页「一键优化」RPC 复用）
+// ---------------------------------------------------------------------------
+
+interface OptimizeIssue {
+  id: string
+  severity: 'high' | 'medium' | 'low'
+  title: string
+  detail: string
+  fix: string
+  count?: number
+}
+
+async function scanIssues(): Promise<{
+  patch: { patched: boolean; file: string | null }
+  stats: { total: number; totalMB: number; empty: number; chunkHeavy: number; oldLarge: number }
+  issues: OptimizeIssue[]
+}> {
+  const sessions = await scanSessions(SESSIONS_ROOT)
+  const totalMB = +(sessions.reduce((a, s) => a + s.sizeBytes, 0) / 1048576).toFixed(1)
+  const empty = sessions.filter(s => s.empty)
+  const chunkHeavy = sessions.filter(s => !s.empty && s.sizeBytes > 2 * 1048576)
+  const oldLarge = sessions.filter(s => !s.empty && s.sizeBytes > 1048576 && s.mtimeMs < Date.now() - 7 * 86400000)
+  const file = findHostApiproxyIndex()
+  const patched = file !== null && (readFileSync(file, 'utf8').includes(PATCH_START) || readFileSync(file, 'utf8').includes('HISTORY_SKIPPED_TYPES'))
+  const issues: OptimizeIssue[] = []
+  if (!patched) {
+    issues.push({
+      id: 'patch-not-applied',
+      severity: 'high',
+      title: 'history 分页补丁未应用',
+      detail: '长会话切换会携带全部流式 chunk（实测 50 条消息一页 2.7 万事件）。应用补丁后降到约 200 事件（130 倍），需重启 web 生效。',
+      fix: 'apply_patch',
+    })
+  }
+  if (empty.length > 0) {
+    issues.push({
+      id: 'empty-sessions',
+      severity: 'medium',
+      title: `${empty.length} 个空/损坏会话`,
+      detail: `0 字节会话占用列表条目，无数据可恢复。移入 ${ARCHIVE_ROOT} 可恢复但无实际意义。`,
+      fix: 'cleanup_empty',
+      count: empty.length,
+    })
+  }
+  if (chunkHeavy.length > 0) {
+    issues.push({
+      id: 'chunk-heavy-sessions',
+      severity: 'medium',
+      title: `${chunkHeavy.length} 个大会话（>2MB，通常 99% 是流式 chunk）`,
+      detail: `最大 ${chunkHeavy[0] ? fmtMB(chunkHeavy[0].sizeBytes) : ''}。切到这些会话最慢；补丁已缓解，进一步可归档不再活跃的。`,
+      fix: 'none',
+      count: chunkHeavy.length,
+    })
+  }
+  if (oldLarge.length > 0) {
+    issues.push({
+      id: 'old-large-sessions',
+      severity: 'low',
+      title: `${oldLarge.length} 个旧大会话可归档`,
+      detail: '超过 7 天未动且大于 1MB 的会话，归档后列表与切换更快（移入 sessions-archive，可恢复）。',
+      fix: 'archive_old',
+      count: oldLarge.length,
+    })
+  }
+  if (issues.length === 0) {
+    issues.push({ id: 'all-good', severity: 'low', title: '没有发现可优化问题', detail: '补丁已应用，会话健康。', fix: 'none' })
+  }
+  return {
+    patch: { patched, file },
+    stats: { total: sessions.length, totalMB, empty: empty.length, chunkHeavy: chunkHeavy.length, oldLarge: oldLarge.length },
+    issues,
+  }
+}
+
+async function applyFix(fix: string): Promise<{ ok: boolean; message: string }> {
+  switch (fix) {
+    case 'apply_patch': {
+      const file = findHostApiproxyIndex()
+      if (file === null) return { ok: false, message: '未找到 dsh-host-apiproxy 部署文件' }
+      const r = applyPatch(file)
+      return { ok: r.patched, message: r.details.join('；') + (r.patched ? '。重启 dsh web 后生效。' : '') }
+    }
+    case 'cleanup_empty': {
+      const sessions = await scanSessions(SESSIONS_ROOT)
+      const empty = sessions.filter(s => s.empty)
+      let moved = 0
+      for (const s of empty) {
+        try {
+          const destWs = join(ARCHIVE_ROOT, s.workspace)
+          await mkdir(destWs, { recursive: true })
+          await rename(s.dir, join(destWs, s.id))
+          moved++
+        } catch { /* 单个失败跳过 */ }
+      }
+      return { ok: true, message: `已移入归档 ${moved}/${empty.length} 个空会话` }
+    }
+    case 'archive_old': {
+      const sessions = await scanSessions(SESSIONS_ROOT)
+      const targets = sessions.filter(s => !s.empty && s.sizeBytes > 1048576 && s.mtimeMs < Date.now() - 7 * 86400000)
+      let moved = 0
+      for (const s of targets) {
+        try {
+          const destWs = join(ARCHIVE_ROOT, s.workspace)
+          await mkdir(destWs, { recursive: true })
+          await rename(s.dir, join(destWs, s.id))
+          moved++
+        } catch { /* 单个失败跳过 */ }
+      }
+      return { ok: true, message: `已归档 ${moved}/${targets.length} 个旧大会话（可恢复）` }
+    }
+    default:
+      return { ok: false, message: `未知修复类型: ${fix}` }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 插件主体
 // ---------------------------------------------------------------------------
 
 export function apply(ctx: Context): void {
+  // ---- 设置页「一键优化」RPC ----
+  harness.handle('optimizer/scan', async () => {
+    try {
+      return { ok: true, ...(await scanIssues()) }
+    } catch (e) {
+      return { ok: false, message: String(e) }
+    }
+  })
+  harness.handle('optimizer/apply', async (args) => {
+    const fix = args && typeof (args as { fix?: string }).fix === 'string' ? (args as { fix: string }).fix : ''
+    if (!fix) return { ok: false, message: '缺少 fix 参数' }
+    try {
+      return await applyFix(fix)
+    } catch (e) {
+      return { ok: false, message: String(e) }
+    }
+  })
+
   // ---- optimizer_audit: 会话体检 ----
   ctx.tools.register(defineTool({
     name: 'optimizer_audit',
@@ -360,7 +480,7 @@ export function apply(ctx: Context): void {
   // ---- optimizer_patch: 补丁管理 ----
   ctx.tools.register(defineTool({
     name: 'optimizer_patch',
-    description: '管理「history 分页跳过流式 chunk」补丁（针对部署的 dsh-host-apiproxy，两处：paginate 返回页滤 chunk + attached 拷贝滤 chunk）：status 检查是否已打补丁，apply 应用补丁（幂等），revert 回滚。补丁让长会话切换从数秒降到亚秒级。',
+    description: '管理「history 分页跳过流式 chunk」补丁（针对部署的 dsh-host-apiproxy）：status 检查，apply 应用（幂等，滤 chunk 且补回边界事件保证分页连续性），revert 回滚。补丁让长会话切换从数秒降到亚秒级。',
     parameters: {
       action: { type: 'string', description: 'status | apply | revert，默认 status', required: true },
     },
@@ -391,7 +511,7 @@ export function apply(ctx: Context): void {
           lines.push(!r.patched ? `✓ 已回滚：${r.details.join('；')}` : `✗ ${r.details.join('；')}`)
         } else {
           const r = inspectPatch(file)
-          lines.push(r.patched ? '✓ 补丁状态: 已应用（两处：paginate 滤 chunk + historyCutOf 滤 chunk）' : '✗ 补丁状态: 未应用')
+          lines.push(r.patched ? '✓ 补丁状态: 已应用（history 页跳过 assistant/chunk，含边界保序）' : '✗ 补丁状态: 未应用')
           if (r.details.length) lines.push(...r.details.map(d => `  - ${d}`))
           lines.push('操作: action=apply 应用，action=revert 回滚。')
         }
