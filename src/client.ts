@@ -115,12 +115,15 @@ function OptimizerSettings(props: { close: () => void }) {
     if (!scan?.issues) return
     setApplying('all')
     try {
-      for (const issue of scan.issues) {
-        if (!issue.fix || issue.fix === 'none') continue
+      const todo = scan.issues.filter(i => i.fix && i.fix !== 'none')
+      if (todo.length === 0) {
+        pushLog('当前没有可一键优化的项（补丁已应用、会话健康）。等出现空会话/24h 未动的大会话/补丁失效后再试。')
+      }
+      for (const issue of todo) {
         const r = (await rpc('optimizer/apply', { fix: issue.fix })) as { ok: boolean; message?: string }
         pushLog(`${r.ok ? '✓' : '✗'} ${issue.title}: ${r.message ?? ''}`)
       }
-      pushLog('一键优化完成')
+      if (todo.length > 0) pushLog('一键优化完成')
       await runScan()
     } catch (e) {
       pushLog('一键优化异常: ' + String(e))
@@ -162,7 +165,7 @@ function OptimizerSettings(props: { close: () => void }) {
         }, loading ? '扫描中…' : '一键扫描'),
         React.createElement('button', {
           className: 'dsh-opt-btn',
-          disabled: applying !== null || fixable.length === 0,
+          disabled: applying !== null,
           onClick: fixAll,
         }, applying === 'all' ? '优化中…' : `一键优化全部 (${fixable.length})`),
       ),
