@@ -19,6 +19,8 @@ await build({
   platform: 'browser',
   target: ['es2022'],
   outfile: join(repo, 'lib', 'client.js'),
+  // React 等平台模块标为 external：运行时由 DSH 的 ModuleLoader require 提供
+  external: ['react', 'react/jsx-runtime', '@deepseek-ai/cordis'],
   banner: {
     js: `window.__ModuleLoader__.load({ id: "${pluginId}", factory: (require) => { var module = { exports: {} }; var exports = module.exports;`,
   },

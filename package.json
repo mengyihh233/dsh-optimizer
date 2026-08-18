@@ -52,8 +52,9 @@
     "@deepseek-ai/dsh-tools": ">=0.1.0-rc.0"
   },
   "devDependencies": {
-    "typescript": "^5.5.0",
     "@types/node": "^24.0.0",
-    "esbuild": "^0.24.0"
+    "@types/react": "^19.2.18",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.5.0"
   }
 }

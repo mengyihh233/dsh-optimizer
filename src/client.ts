@@ -4,19 +4,14 @@
  * 通过 host 自建的 HTTP RPC endpoint 通信（/dsh-optimizer/rpc）。
  */
 
-// client 运行时全局（bundle 插件 builtin）——TS 类型声明
-declare const React: {
-  createElement: (type: unknown, props: Record<string, unknown> | null, ...children: unknown[]) => unknown
-  useState: <T>(initial: T) => [T, (v: T | ((p: T) => T)) => void]
-  useEffect: (effect: () => void | (() => void), deps?: unknown[]) => void
-  useCallback: <T extends (...args: never[]) => unknown>(fn: T, deps: unknown[]) => T
-  useMemo: <T>(fn: () => T, deps: unknown[]) => T
-}
-declare const styles: { insert: (css: string) => () => void }
+// React 从 ModuleLoader 的 require('react') 获取（bundle client 无全局 React；
+// build-client.mjs 把 react 标为 external，运行时由 DSH 提供）。
+import React from 'react'
 
 import type { Context } from '@deepseek-ai/cordis'
 
-// bundle 插件 client 半部无 host.call —— 走 host 自建的 HTTP RPC endpoint
+// bundle 插件 client 半部无 host.call / styles builtin —— 走 host 自建 HTTP RPC，
+// CSS 用原生 DOM 注入（learn-everything 同款）
 async function rpc(method: string, args?: Record<string, unknown>): Promise<Record<string, unknown>> {
   const res = await fetch('/dsh-optimizer/rpc', {
     method: 'POST',
@@ -207,7 +202,19 @@ function OptimizerSettings(props: { close: () => void }) {
 }
 
 export function apply(ctx: Context): void {
-  styles.insert(CSS)
+  // bundle client 无 styles builtin —— 原生 DOM 注入（learn-everything 同款），幂等
+  try {
+    if (typeof document !== 'undefined') {
+      if (document.getElementById('dsh-optimizer-css') === null) {
+        const styleEl = document.createElement('style')
+        styleEl.id = 'dsh-optimizer-css'
+        styleEl.textContent = CSS
+        document.head.appendChild(styleEl)
+      }
+    }
+  } catch {
+    // CSS 注入失败不影响功能
+  }
   const slots = ctx.get('slots')
   if (slots === undefined) return
   slots.inject('settings.section', () =>
