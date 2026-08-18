@@ -25,7 +25,7 @@ import { zstdDecompressSync } from 'node:zlib'
 // @deepseek-ai/* 的可解析性由 scripts/setup-dsh-links.mjs 提供（junction 链接部署根）。
 
 export const name = 'dsh-optimizer'
-export const inject = ['tools']
+export const inject = ['tools', 'webServer']
 
 // ---------------------------------------------------------------------------
 // 路径
