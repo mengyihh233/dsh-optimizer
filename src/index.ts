@@ -349,15 +349,9 @@ export function apply(ctx: Context): void {
           return
         }
         let body = ''
-        const on = request.on
-        if (typeof on === 'function') {
-          await new Promise<void>((resolve) => {
-            let settled = false
-            const finish = () => { if (!settled) { settled = true; resolve() } }
-            on('data', (chunk: string) => { body += chunk })
-            on('end', finish)
-            on('error', finish)
-          })
+        // 用 async iterable 读 body（IncomingMessage 可靠支持；on() 提取解绑 this 有坑）
+        if (request !== undefined && typeof (request as { [Symbol.asyncIterator]?: unknown })[Symbol.asyncIterator] === 'function') {
+          for await (const chunk of request as unknown as AsyncIterable<Buffer | string>) body += String(chunk)
         }
         let method = ''
         let args: Record<string, unknown> = {}
